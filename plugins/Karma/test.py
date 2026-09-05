@@ -237,12 +237,10 @@ class KarmaTrackUserVotesTestCase(ChannelPluginTestCase):
         ChannelPluginTestCase.setUp(self)
         # Enable trackUserVotes for these tests
         conf.supybot.plugins.Karma.trackUserVotes.setValue(True)
-        # Enable response so we can see "is now" messages
-        conf.supybot.plugins.Karma.response.setValue(True)
+        # response stays False (default) - tests use assertNoResponse
     
     def tearDown(self):
         conf.supybot.plugins.Karma.trackUserVotes.setValue(False)
-        conf.supybot.plugins.Karma.response.setValue(False)
         ChannelPluginTestCase.tearDown(self)
     
     def testTrackUserVotesPreventsDoubleIncrement(self):
