@@ -29,6 +29,7 @@
 ###
 
 from supybot.test import *
+from supybot import ircmsgs
 
 import sqlite3
 
@@ -226,4 +227,121 @@ class KarmaTestCase(ChannelPluginTestCase):
         finally:
             karma.onlynicks.setValue(onlynicks)
             karma.response.setValue(resp)
+
+
+class KarmaTrackUserVotesTestCase(ChannelPluginTestCase):
+    """Tests for trackUserVotes config option."""
+    plugins = ('Karma',)
+    
+    def setUp(self):
+        ChannelPluginTestCase.setUp(self)
+        # Enable trackUserVotes for these tests
+        conf.supybot.plugins.Karma.trackUserVotes.setValue(True)
+        # Enable response so we can see "is now" messages
+        conf.supybot.plugins.Karma.response.setValue(True)
+    
+    def tearDown(self):
+        conf.supybot.plugins.Karma.trackUserVotes.setValue(False)
+        conf.supybot.plugins.Karma.response.setValue(False)
+        ChannelPluginTestCase.tearDown(self)
+    
+    def testTrackUserVotesPreventsDoubleIncrement(self):
+        """Same user voting ++ twice should be ignored on second vote."""
+        self.assertNoResponse('foo++', 2)  # first ++
+        self.assertRegexp('karma foo', 'increased 1.*total.*1')
+        self.assertNoResponse('foo++', 2)  # second ++ should be ignored
+        self.assertRegexp('karma foo', 'increased 1.*total.*1')  # still 1
+    
+    def testTrackUserVotesPreventsDoubleDecrement(self):
+        """Same user voting -- twice should be ignored on second vote."""
+        self.assertNoResponse('foo--', 2)  # first --
+        self.assertRegexp('karma foo', 'decreased 1.*total.*-1')
+        self.assertNoResponse('foo--', 2)  # second -- should be ignored
+        self.assertRegexp('karma foo', 'decreased 1.*total.*-1')  # still -1
+    
+    def testTrackUserVotesFlipIncrementToDecrement(self):
+        """User voting ++ then -- should flip vote to --."""
+        self.assertNoResponse('foo++', 2)  # first ++
+        self.assertRegexp('karma foo', 'increased 1.*total.*1')
+        self.assertNoResponse('foo--', 2)  # flip to --
+        self.assertRegexp('karma foo', 'decreased 1.*total.*-1')
+    
+    def testTrackUserVotesFlipDecrementToIncrement(self):
+        """User voting -- then ++ should flip vote to ++."""
+        self.assertNoResponse('foo--', 2)  # first --
+        self.assertRegexp('karma foo', 'decreased 1.*total.*-1')
+        self.assertNoResponse('foo++', 2)  # flip to ++
+        self.assertRegexp('karma foo', 'increased 1.*total.*1')
+    
+    def testTrackUserVotesMultipleUsers(self):
+        """Different users can vote independently."""
+        # User1 (self.nick) votes ++
+        self.assertNoResponse('foo++', 2)
+        self.assertRegexp('karma foo', 'total.*1')
+        
+        # Simulate another user voting ++
+        msg = ircmsgs.join(self.channel, prefix='user2!foo@bar')
+        self.irc.feedMsg(msg)
+        # Send message as user2
+        self.irc.feedMsg(ircmsgs.privmsg(self.channel, 'foo++', prefix='user2!foo@bar'))
+        
+        # Check karma is now 2
+        self.assertRegexp('karma foo', 'total.*2')
+        
+        # User2 votes again (should be ignored)
+        self.irc.feedMsg(ircmsgs.privmsg(self.channel, 'foo++', prefix='user2!foo@bar'))
+        self.assertRegexp('karma foo', 'total.*2')  # still 2
+        
+        # User2 flips to --
+        self.irc.feedMsg(ircmsgs.privmsg(self.channel, 'foo--', prefix='user2!foo@bar'))
+        self.assertRegexp('karma foo', 'total.*0')  # back to 0 (user1: +1, user2: -1)
+    
+    def testTrackUserVotesDisabledByDefault(self):
+        """When trackUserVotes is False, old behavior allows multiple votes."""
+        conf.supybot.plugins.Karma.trackUserVotes.setValue(False)
+        try:
+            self.assertNoResponse('foo++', 2)
+            self.assertRegexp('karma foo', 'total.*1')
+            self.assertNoResponse('foo++', 2)  # second ++ should count
+            self.assertRegexp('karma foo', 'total.*2')
+            self.assertNoResponse('foo++', 2)  # third ++ should count
+            self.assertRegexp('karma foo', 'total.*3')
+        finally:
+            conf.supybot.plugins.Karma.trackUserVotes.setValue(True)
+    
+    def testTrackUserVotesClearRemovesVotes(self):
+        """Clear should remove user votes too."""
+        self.assertNoResponse('foo++', 2)
+        self.assertRegexp('karma foo', 'total.*1')
+        self.assertNotError('karma clear foo')
+        self.assertRegexp('karma foo', 'neutral')
+        # After clear, user should be able to vote again
+        self.assertNoResponse('foo++', 2)
+        self.assertRegexp('karma foo', 'total.*1')
+    
+    def testTrackUserVotesWithSelfRatingDisabled(self):
+        """trackUserVotes should respect allowSelfRating=False."""
+        nick = self.nick
+        try:
+            conf.supybot.plugins.Karma.allowSelfRating.setValue(False)
+            self.assertError('%s++' % nick)
+            self.assertResponse('karma %s' % nick, '%s has neutral karma.' % nick)
+        finally:
+            conf.supybot.plugins.Karma.allowSelfRating.setValue(True)
+    
+    def testTrackUserVotesCaseInsensitive(self):
+        """Votes should be case-insensitive for thing names."""
+        self.assertNoResponse('Foo++', 2)
+        self.assertRegexp('karma foo', 'total.*1')
+        self.assertNoResponse('FOO++', 2)  # same thing, different case
+        self.assertRegexp('karma foo', 'total.*1')  # still 1
+    
+    def testTrackUserVotesMultiWord(self):
+        """trackUserVotes should work with multi-word karma."""
+        self.assertNoResponse('(foo bar)++', 2)
+        self.assertRegexp('karma "foo bar"', 'total.*1')
+        self.assertNoResponse('(foo bar)++', 2)  # duplicate should be ignored
+        self.assertRegexp('karma "foo bar"', 'total.*1')
+
+
 # vim:set shiftwidth=4 softtabstop=4 expandtab textwidth=79:

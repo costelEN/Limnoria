@@ -11,7 +11,7 @@
 #     this list of conditions, and the following disclaimer.
 #   * Redistributions in binary form must reproduce the above copyright notice,
 #     this list of conditions, and the following disclaimer in the
-#     documentation and/or materials provided with the distribution.
+#     documentation and/or other materials provided with the distribution.
 #   * Neither the name of the author of this software nor the name of
 #     contributors to this software may be used to endorse or promote products
 #     derived from this software without specific prior written consent.
@@ -66,22 +66,26 @@ class SqliteKarmaDB(object):
         if os.path.exists(filename):
             db = sqlite3.connect(filename, check_same_thread=False)
             self.dbs[filename] = db
-            self._initSchema(db)
             return db
         db = sqlite3.connect(filename, check_same_thread=False)
         self.dbs[filename] = db
-        self._initSchema(db)
-        return db
-
-    def _initSchema(self, db):
         cursor = db.cursor()
-        cursor.execute("""CREATE TABLE IF NOT EXISTS karma (
+        cursor.execute("""CREATE TABLE karma (
                           id INTEGER PRIMARY KEY,
                           name TEXT,
                           normalized TEXT UNIQUE ON CONFLICT IGNORE,
                           added INTEGER,
                           subtracted INTEGER
                           )""")
+        db.commit()
+        def p(s1, s2):
+            return int(ircutils.nickEqual(s1, s2))
+        db.create_function('nickeq', 2, p)
+        return db
+
+    def _ensureVotesTable(self, db):
+        """Create karma_votes table if it doesn't exist."""
+        cursor = db.cursor()
         cursor.execute("""CREATE TABLE IF NOT EXISTS karma_votes (
                           channel TEXT,
                           user TEXT,
@@ -90,9 +94,6 @@ class SqliteKarmaDB(object):
                           PRIMARY KEY (channel, user, thing_normalized)
                           )""")
         db.commit()
-        def p(s1, s2):
-            return int(ircutils.nickEqual(s1, s2))
-        db.create_function('nickeq', 2, p)
 
     def get(self, channel, thing):
         db = self._getDb(channel)
@@ -158,6 +159,7 @@ class SqliteKarmaDB(object):
     def _getUserVote(self, channel, user, thing):
         """Get the user's current vote for a thing. Returns 1, -1, or None."""
         db = self._getDb(channel)
+        self._ensureVotesTable(db)
         cursor = db.cursor()
         cursor.execute("""SELECT vote FROM karma_votes
                           WHERE channel=? AND user=? AND thing_normalized=?""",
@@ -170,6 +172,7 @@ class SqliteKarmaDB(object):
     def _setUserVote(self, channel, user, thing, vote):
         """Set or update a user's vote for a thing."""
         db = self._getDb(channel)
+        self._ensureVotesTable(db)
         cursor = db.cursor()
         cursor.execute("""INSERT OR REPLACE INTO karma_votes
                           (channel, user, thing_normalized, vote)
@@ -177,66 +180,50 @@ class SqliteKarmaDB(object):
                        (channel, user.lower(), thing.lower(), vote))
         db.commit()
 
-    def _deleteUserVote(self, channel, user, thing):
-        """Delete a user's vote for a thing."""
+    def _vote(self, channel, name, user, vote):
+        """
+        Record a vote for a thing.
+        vote: 1 for increment (++), -1 for decrement (--)
+        Returns True if vote was recorded/changed, False if duplicate same-direction vote.
+        """
         db = self._getDb(channel)
-        cursor = db.cursor()
-        cursor.execute("""DELETE FROM karma_votes
-                          WHERE channel=? AND user=? AND thing_normalized=?""",
-                       (channel, user.lower(), thing.lower()))
-        db.commit()
-
-    def increment(self, channel, name, user):
-        db = self._getDb(channel)
+        self._ensureVotesTable(db)
         normalized = name.lower()
         cursor = db.cursor()
         
         # Check if user already voted
         existing_vote = self._getUserVote(channel, user, normalized)
-        if existing_vote == 1:
-            # User already voted ++, ignore
+        if existing_vote == vote:
+            # User already voted same direction, ignore
             return False
-        elif existing_vote == -1:
-            # User voted --, change to ++
-            cursor.execute("""UPDATE karma SET added=added+1, subtracted=subtracted-1
-                              WHERE normalized=?""", (normalized,))
-            self._setUserVote(channel, user, normalized, 1)
+        elif existing_vote == -vote:
+            # User voted opposite direction, flip vote
+            if vote == 1:
+                cursor.execute("""UPDATE karma SET added=added+1, subtracted=subtracted-1
+                                  WHERE normalized=?""", (normalized,))
+            else:
+                cursor.execute("""UPDATE karma SET added=added-1, subtracted=subtracted+1
+                                  WHERE normalized=?""", (normalized,))
+            self._setUserVote(channel, user, normalized, vote)
             db.commit()
             return True
         
         # New vote
         cursor.execute("""INSERT OR IGNORE INTO karma VALUES (NULL, ?, ?, 0, 0)""",
                        (name, normalized,))
-        cursor.execute("""UPDATE karma SET added=added+1 WHERE normalized=?""", (normalized,))
-        self._setUserVote(channel, user, normalized, 1)
+        if vote == 1:
+            cursor.execute("""UPDATE karma SET added=added+1 WHERE normalized=?""", (normalized,))
+        else:
+            cursor.execute("""UPDATE karma SET subtracted=subtracted+1 WHERE normalized=?""", (normalized,))
+        self._setUserVote(channel, user, normalized, vote)
         db.commit()
         return True
 
-    def decrement(self, channel, name, user):
-        db = self._getDb(channel)
-        normalized = name.lower()
-        cursor = db.cursor()
-        
-        # Check if user already voted
-        existing_vote = self._getUserVote(channel, user, normalized)
-        if existing_vote == -1:
-            # User already voted --, ignore
-            return False
-        elif existing_vote == 1:
-            # User voted ++, change to --
-            cursor.execute("""UPDATE karma SET added=added-1, subtracted=subtracted+1
-                              WHERE normalized=?""", (normalized,))
-            self._setUserVote(channel, user, normalized, -1)
-            db.commit()
-            return True
-        
-        # New vote
-        cursor.execute("""INSERT OR IGNORE INTO karma VALUES (NULL, ?, ?, 0, 0)""",
-                       (name, normalized,))
-        cursor.execute("""UPDATE karma SET subtracted=subtracted+1 WHERE normalized=?""", (normalized,))
-        self._setUserVote(channel, user, normalized, -1)
-        db.commit()
-        return True
+    def increment(self, channel, name, user=None):
+        return self._vote(channel, name, user, 1)
+
+    def decrement(self, channel, name, user=None):
+        return self._vote(channel, name, user, -1)
 
     def most(self, channel, kind, limit):
         if kind == 'increased':
@@ -311,10 +298,11 @@ class Karma(callbacks.Plugin):
     Alternatively, you can restrict karma tracking to nicks in the current
     channel by setting `config plugins.Karma.onlyNicks` to ``True``.
 
-    If ``config plugins.karma.allowUnaddressedKarma` is set to `False``, you
-    must address the bot with nick or prefix to add or subtract karma.
+    If ``config plugins.karma.allowUnaddressedKarma` is set to `False``,
+    you must address the bot with nick or prefix to add or subtract karma.
 
-    Each user can only vote once per thing. A second vote in the same
+    If ``config plugins.karma.trackUserVotes`` is set to ``True``,
+    each user can only vote once per thing. A second vote in the same
     direction is ignored. A vote in the opposite direction changes the vote.
     """
     callBefore = ('Factoids', 'MoobotFactoids', 'Infobot')
@@ -344,6 +332,7 @@ class Karma(callbacks.Plugin):
         inc = self.registryValue('incrementChars', channel, irc.network)
         dec = self.registryValue('decrementChars', channel, irc.network)
         onlynicks = self.registryValue('onlyNicks', channel, irc.network)
+        track_votes = self.registryValue('trackUserVotes', channel, irc.network)
         karma = None
         for s in inc:
             if thing.endswith(s):
@@ -357,9 +346,13 @@ class Karma(callbacks.Plugin):
                                            channel, irc.network):
                         irc.error(_('You\'re not allowed to adjust your own karma.'))
                         return
-                result = self.db.increment(channel, self._normalizeThing(thing), msg.nick)
-                if result is not False:
-                    karma = self.db.get(channel, self._normalizeThing(thing))
+                if track_votes:
+                    result = self.db.increment(channel, self._normalizeThing(thing), msg.nick)
+                    if not result:
+                        return
+                else:
+                    self.db.increment(channel, self._normalizeThing(thing))
+                karma = self.db.get(channel, self._normalizeThing(thing))
         for s in dec:
             if thing.endswith(s):
                 thing = thing[:-len(s)].rstrip(",:\t ")
@@ -371,9 +364,13 @@ class Karma(callbacks.Plugin):
                                            channel, irc.network):
                     irc.error(_('You\'re not allowed to adjust your own karma.'))
                     return
-                result = self.db.decrement(channel, self._normalizeThing(thing), msg.nick)
-                if result is not False:
-                    karma = self.db.get(channel, self._normalizeThing(thing))
+                if track_votes:
+                    result = self.db.decrement(channel, self._normalizeThing(thing), msg.nick)
+                    if not result:
+                        return
+                else:
+                    self.db.decrement(channel, self._normalizeThing(thing))
+                karma = self.db.get(channel, self._normalizeThing(thing))
         if karma:
             self._respond(irc, channel, thing, karma[0]-karma[1])
 
